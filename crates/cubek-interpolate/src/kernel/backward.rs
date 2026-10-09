@@ -35,6 +35,7 @@ pub(crate) fn interpolate_nearest_backward_launch(
     let address_type = out_grad
         .required_address_type(dtype.size())
         .max(input_grad.required_address_type(dtype.size()));
+    let index_dtype = boundary_dtype(&input_grad.shape[1..3], &out_grad.shape[1..3]);
 
     unsafe {
         execute_interpolate_nearest_backward::launch_unchecked(
@@ -49,9 +50,25 @@ pub(crate) fn interpolate_nearest_backward_launch(
             input_grad_layout,
             nearest_mode,
             dtype,
+            index_dtype,
         )
     };
     Ok(())
+}
+
+// Small tensors can still have coordinate products exceeding u32 (for example,
+// a 65537 x 1 identity resize). Shape validation limits each extent to i32::MAX,
+// so their product fits in u64. Ordinary image sizes retain 32-bit indexing.
+fn boundary_dtype(input_size: &[usize], output_size: &[usize]) -> ElemType {
+    if input_size.iter().zip(output_size).any(|(input, output)| {
+        input
+            .checked_mul(*output)
+            .is_none_or(|product| product > u32::MAX as usize)
+    }) {
+        ElemType::UInt(UIntKind::U64)
+    } else {
+        ElemType::UInt(UIntKind::U32)
+    }
 }
 
 fn shape_divmod(binding: &TensorBinding) -> SequenceArg<FastDivmod<usize>> {
@@ -72,13 +89,14 @@ fn linear_layout(binding: &TensorBinding, vector_size: usize) -> LinearLayoutLau
 }
 
 #[cube(launch_unchecked, address_type = "dynamic")]
-pub fn execute_interpolate_nearest_backward<F: Float, N: Size>(
+pub fn execute_interpolate_nearest_backward<F: Float, I: Int, N: Size>(
     grad: &Tensor<Vector<F, N>>,
     input_grad: &mut Tensor<Vector<F, N>>,
     input_grad_shape: Sequence<FastDivmod<usize>>,
     input_grad_layout: LinearLayout,
     #[comptime] nearest_mode: NearestMode,
     #[define(F)] _dtype: ElemType,
+    #[define(I)] _index_dtype: ElemType,
 ) {
     if ABSOLUTE_POS >= input_grad.len() {
         terminate!();
@@ -96,10 +114,10 @@ pub fn execute_interpolate_nearest_backward<F: Float, N: Size>(
     let (rem, out_x) = input_grad_shape[2].div_mod(rem);
     let (b, out_y) = input_grad_shape[1].div_mod(rem);
 
-    let grad_y_start = start_index::<F>(out_y, grad_h, out_h, nearest_mode);
-    let grad_y_end = end_index::<F>(out_y, grad_h, out_h, nearest_mode);
-    let grad_x_start = start_index::<F>(out_x, grad_w, out_w, nearest_mode);
-    let grad_x_end = end_index::<F>(out_x, grad_w, out_w, nearest_mode);
+    let grad_y_start = start_index::<I>(out_y, grad_h, out_h, nearest_mode);
+    let grad_y_end = end_index::<I>(out_y, grad_h, out_h, nearest_mode);
+    let grad_x_start = start_index::<I>(out_x, grad_w, out_w, nearest_mode);
+    let grad_x_end = end_index::<I>(out_x, grad_w, out_w, nearest_mode);
 
     let index_grad_base = b * grad.stride(0) + c * grad.stride(3);
 
@@ -117,35 +135,69 @@ pub fn execute_interpolate_nearest_backward<F: Float, N: Size>(
 }
 
 #[cube]
-fn start_index<F: Float>(
+fn start_index<I: Int>(
     input_index: usize,
     output_size: usize,
     input_size: usize,
     #[comptime] nearest_mode: NearestMode,
 ) -> usize {
+    // Invert floor(j * input_size / output_size), or the half-pixel mapping
+    // floor((j + 0.5) * input_size / output_size) for Exact. Floating division
+    // followed by ceil can overshoot even in f32, shifting interior boundaries
+    // and reading past grad at the last boundary. Do not use the tensor dtype
+    // for coordinates: f16 also rounds/overflows these products.
+    let numerator = I::cast_from(input_index) * I::cast_from(output_size);
+    let divisor = I::cast_from(input_size);
+    let quotient = numerator / divisor;
+    let remainder = numerator - quotient * divisor;
     match nearest_mode {
         NearestMode::Floor => {
-            let numerator = F::cast_from(input_index * output_size);
-            let div = (numerator / F::cast_from(input_size)).ceil();
-            usize::cast_from(div)
+            usize::cast_from(quotient + I::cast_from(remainder != I::from_int(0)))
         }
+        // ceil(n / d - 0.5), clamped to zero, without doubling n or subtracting
+        // from an unsigned value. This also preserves exact half-pixel ties.
         NearestMode::Exact => {
-            let num = F::cast_from(input_index * output_size);
-            let den = F::cast_from(input_size);
-            let div = num / den - F::new(0.5_f32);
-
-            let mask = F::cast_from((div >= F::zero()) as usize);
-            usize::cast_from(div.ceil() * mask)
+            usize::cast_from(quotient + I::cast_from(remainder > divisor / I::from_int(2)))
         }
     }
 }
 
 #[cube]
-fn end_index<F: Float>(
+fn end_index<I: Int>(
     input_index: usize,
     output_size: usize,
     input_size: usize,
     #[comptime] nearest_mode: NearestMode,
 ) -> usize {
-    start_index::<F>(input_index + 1, output_size, input_size, nearest_mode)
+    start_index::<I>(input_index + 1, output_size, input_size, nearest_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_products_select_sufficient_integer_width() {
+        assert_eq!(
+            boundary_dtype(&[120, 144], &[48, 64]),
+            ElemType::UInt(UIntKind::U32)
+        );
+        assert_eq!(
+            boundary_dtype(&[65_535, 1], &[65_537, 1]),
+            ElemType::UInt(UIntKind::U32)
+        );
+        assert_eq!(
+            boundary_dtype(&[65_536, 1], &[65_536, 1]),
+            ElemType::UInt(UIntKind::U64)
+        );
+        assert_eq!(
+            boundary_dtype(&[1, 65_537], &[1, 65_537]),
+            ElemType::UInt(UIntKind::U64)
+        );
+        let max = i32::MAX as usize;
+        assert_eq!(
+            boundary_dtype(&[max, 1], &[max, 1]),
+            ElemType::UInt(UIntKind::U64)
+        );
+    }
 }

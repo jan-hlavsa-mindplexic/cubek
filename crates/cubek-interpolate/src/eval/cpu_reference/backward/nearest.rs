@@ -53,10 +53,12 @@ fn start_index(
     input_size: usize,
     nearest_mode: NearestMode,
 ) -> usize {
-    let ratio = (input_index * output_size) as f32 / input_size as f32;
+    let numerator = input_index as u64 * output_size as u64;
+    let quotient = numerator / input_size as u64;
+    let remainder = numerator % input_size as u64;
     match nearest_mode {
-        NearestMode::Floor => ratio.ceil() as usize,
-        NearestMode::Exact => (ratio - 0.5).ceil().max(0.0) as usize,
+        NearestMode::Floor => (quotient + u64::from(remainder != 0)) as usize,
+        NearestMode::Exact => (quotient + u64::from(remainder > input_size as u64 / 2)) as usize,
     }
 }
 
@@ -84,5 +86,43 @@ mod tests {
 
         assert_eq!(floor, [0, 3, 5, 8, 10]);
         assert_eq!(exact, [0, 2, 5, 7, 10]);
+    }
+
+    #[test]
+    fn inverse_boundaries_match_forward_selection_counts() {
+        for mode in [NearestMode::Floor, NearestMode::Exact] {
+            for input_size in 1..=31 {
+                for output_size in 1..=31 {
+                    for index in 0..=input_size {
+                        let expected = (0..output_size)
+                            .filter(|&output| {
+                                let source = match mode {
+                                    NearestMode::Floor => output * input_size / output_size,
+                                    NearestMode::Exact => {
+                                        (2 * output + 1) * input_size / (2 * output_size)
+                                    }
+                                };
+                                source < index
+                            })
+                            .count();
+                        assert_eq!(
+                            start_index(index, output_size, input_size, mode),
+                            expected,
+                            "{mode:?}: input={input_size}, output={output_size}, index={index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_coordinate_products_remain_exact() {
+        let size = i32::MAX as usize;
+        for mode in [NearestMode::Floor, NearestMode::Exact] {
+            for index in [0, 1, size / 2, size - 1, size] {
+                assert_eq!(start_index(index, size, size, mode), index);
+            }
+        }
     }
 }
