@@ -127,12 +127,15 @@ impl WeightLayoutLaunch {
         WeightLayoutLaunch::new(padded_channels, shape_k, shape_n, params, config)
     }
 
-    fn from_args_out(problem: &ConvolutionProblem, config: GlobalLayoutConfig) -> Self {
+    fn from_args_out(problem: &ConvolutionProblem, mut config: GlobalLayoutConfig) -> Self {
         let padded_channels = problem.padded_channels as u32;
         let shape_m = problem.m as u32;
         let shape_n = problem.n as u32;
 
         let params = ConvolutionParams::from_problem(problem);
+
+        // The enclosing Transpose maps matmul (M, N) to this layout's (N, M).
+        core::mem::swap(&mut config.check_row_bounds, &mut config.check_col_bounds);
 
         WeightLayoutLaunch::new(padded_channels, shape_n, shape_m, params, config)
     }

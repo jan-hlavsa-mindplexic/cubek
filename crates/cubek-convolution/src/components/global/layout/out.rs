@@ -104,10 +104,13 @@ impl OutLayoutLaunch {
         Self::new(shape, shape_m, shape_n, config)
     }
 
-    fn from_args_wgrad(problem: &ConvolutionProblem, config: GlobalLayoutConfig) -> Self {
+    fn from_args_wgrad(problem: &ConvolutionProblem, mut config: GlobalLayoutConfig) -> Self {
         let shape_out = problem.out_shape.iter().map(|s| *s as u32).collect();
         let shape_m = problem.m as u32;
         let shape_k = problem.k as u32;
+
+        // The enclosing Transpose maps matmul (M, K) to this layout's (K, M).
+        core::mem::swap(&mut config.check_row_bounds, &mut config.check_col_bounds);
 
         Self::new(shape_out, shape_k, shape_m, config)
     }
